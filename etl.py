@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Load daily trades and positions into a Snowflake custodian warehouse.
+"""Load daily trades, positions, and close prices into a Snowflake custodian warehouse.
 
 Usage:
     python3 etl.py trades sample_trades.csv
     python3 etl.py positions sample_positions.csv
+    python3 etl.py prices sample_prices.csv
     python3 etl.py trades trades.csv --dry-run
     python3 etl.py positions positions.csv --validate-only
 
@@ -12,7 +13,8 @@ Credentials come only from environment variables:
     SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
 See .env.example. The loader stages the file with PUT/COPY, then
 MERGEs it into the target table on the natural key (trade_id for
-trades, account_id + cusip + as_of_date for positions).
+trades, account_id + cusip + as_of_date for positions,
+cusip + price_date for prices).
 """
 
 import argparse
@@ -28,6 +30,9 @@ TRADE_FIELDS = [
 POSITION_FIELDS = [
     "account_id", "cusip", "quantity", "cost_basis", "as_of_date",
 ]
+PRICE_FIELDS = [
+    "cusip", "price_date", "close_price",
+]
 
 VALID_SIDES = {"BUY", "SELL"}
 VALID_CYCLES = {"T+1", "T+2"}
@@ -42,7 +47,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Load trades or positions into the Snowflake custodian warehouse."
     )
-    parser.add_argument("kind", choices=["trades", "positions"])
+    parser.add_argument("kind", choices=["trades", "positions", "prices"])
     parser.add_argument("csv_file")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate and print what would load, without touching Snowflake")
@@ -119,6 +124,23 @@ def validate_positions(rows):
     return rows
 
 
+def validate_prices(rows):
+    seen = set()
+    for i, row in enumerate(rows, start=2):
+        for field in PRICE_FIELDS:
+            if row.get(field) in (None, ""):
+                raise ValueError(f"Row {i}: missing {field}")
+        key = (row["cusip"], row["price_date"])
+        if key in seen:
+            raise ValueError(f"Row {i}: duplicate price {key}")
+        seen.add(key)
+        validate_number(row["close_price"], "close_price")
+        if float(row["close_price"]) < 0:
+            raise ValueError(f"Row {i}: close_price must not be negative")
+        validate_date(row["price_date"], "price_date")
+    return rows
+
+
 def connect():
     try:
         import snowflake.connector
@@ -144,8 +166,12 @@ def connect():
 
 
 def load(conn, kind, csv_file, rows):
-    staging = "TRADES_STAGING" if kind == "trades" else "POSITIONS_STAGING"
-    target = "TRADES" if kind == "trades" else "POSITIONS"
+    staging = {
+        "trades": "TRADES_STAGING",
+        "positions": "POSITIONS_STAGING",
+        "prices": "PRICES_STAGING",
+    }[kind]
+    target = kind.upper()
     cur = conn.cursor()
     try:
         cur.execute(f"TRUNCATE TABLE {staging}")
@@ -172,7 +198,7 @@ def load(conn, kind, csv_file, rows):
                     (s.trade_id, s.account_id, s.cusip, s.side, s.quantity,
                      s.price, s.trade_date, s.settlement_date, s.settlement_cycle)
             """)
-        else:
+        elif kind == "positions":
             cur.execute("""
                 MERGE INTO POSITIONS t USING POSITIONS_STAGING s
                     ON t.account_id = s.account_id
@@ -186,6 +212,19 @@ def load(conn, kind, csv_file, rows):
                 VALUES
                     (s.account_id, s.cusip, s.quantity, s.cost_basis, s.as_of_date)
             """)
+        else:
+            cur.execute("""
+                MERGE INTO PRICES t USING PRICES_STAGING s
+                    ON t.cusip = s.cusip
+                    AND t.price_date = s.price_date
+                WHEN MATCHED THEN UPDATE SET
+                    t.close_price = s.close_price,
+                    t.loaded_at = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT
+                    (cusip, price_date, close_price)
+                VALUES
+                    (s.cusip, s.price_date, s.close_price)
+            """)
         print(f"Loaded {len(rows)} {kind} rows into {target} "
               f"({cur.rowcount} rows merged).")
     finally:
@@ -194,8 +233,16 @@ def load(conn, kind, csv_file, rows):
 
 def main():
     args = parse_args()
-    fields = TRADE_FIELDS if args.kind == "trades" else POSITION_FIELDS
-    validate = validate_trades if args.kind == "trades" else validate_positions
+    fields = {
+        "trades": TRADE_FIELDS,
+        "positions": POSITION_FIELDS,
+        "prices": PRICE_FIELDS,
+    }[args.kind]
+    validate = {
+        "trades": validate_trades,
+        "positions": validate_positions,
+        "prices": validate_prices,
+    }[args.kind]
     try:
         rows = validate(read_rows(args.csv_file, fields))
     except (FileNotFoundError, ValueError) as exc:
