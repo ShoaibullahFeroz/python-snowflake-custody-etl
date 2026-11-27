@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Load daily trades, positions, and close prices into a Snowflake custodian warehouse.
+"""Load daily trades, positions, close prices, and corporate actions
+into a Snowflake custodian warehouse.
 
 Usage:
     python3 etl.py trades sample_trades.csv
     python3 etl.py positions sample_positions.csv
     python3 etl.py prices sample_prices.csv
+    python3 etl.py corporate_actions sample_corporate_actions.csv
     python3 etl.py trades trades.csv --dry-run
     python3 etl.py positions positions.csv --validate-only
 
@@ -14,7 +16,7 @@ Credentials come only from environment variables:
 See .env.example. The loader stages the file with PUT/COPY, then
 MERGEs it into the target table on the natural key (trade_id for
 trades, account_id + cusip + as_of_date for positions,
-cusip + price_date for prices).
+cusip + price_date for prices, action_id for corporate actions).
 """
 
 import argparse
@@ -33,9 +35,14 @@ POSITION_FIELDS = [
 PRICE_FIELDS = [
     "cusip", "price_date", "close_price",
 ]
+CORPORATE_ACTION_FIELDS = [
+    "action_id", "cusip", "action_type", "ex_date", "record_date",
+    "pay_date", "amount_per_share", "currency",
+]
 
 VALID_SIDES = {"BUY", "SELL"}
 VALID_CYCLES = {"T+1", "T+2"}
+VALID_ACTION_TYPES = {"DIVIDEND", "COUPON", "SPLIT"}
 
 
 def fail(message):
@@ -45,9 +52,11 @@ def fail(message):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Load trades or positions into the Snowflake custodian warehouse."
+        description="Load trades, positions, prices, or corporate actions "
+                    "into the Snowflake custodian warehouse."
     )
-    parser.add_argument("kind", choices=["trades", "positions", "prices"])
+    parser.add_argument("kind", choices=["trades", "positions", "prices",
+                                         "corporate_actions"])
     parser.add_argument("csv_file")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate and print what would load, without touching Snowflake")
@@ -141,6 +150,37 @@ def validate_prices(rows):
     return rows
 
 
+def validate_corporate_actions(rows):
+    seen = set()
+    for i, row in enumerate(rows, start=2):
+        for field in CORPORATE_ACTION_FIELDS:
+            if row.get(field) in (None, ""):
+                raise ValueError(f"Row {i}: missing {field}")
+        if row["action_id"] in seen:
+            raise ValueError(f"Row {i}: duplicate action_id {row['action_id']}")
+        seen.add(row["action_id"])
+        if row["action_type"] not in VALID_ACTION_TYPES:
+            raise ValueError(
+                f"Row {i}: action_type must be DIVIDEND, COUPON or SPLIT, "
+                f"got {row['action_type']}"
+            )
+        validate_number(row["amount_per_share"], "amount_per_share")
+        if float(row["amount_per_share"]) < 0:
+            raise ValueError(f"Row {i}: amount_per_share must not be negative")
+        if row["action_type"] == "SPLIT" and float(row["amount_per_share"]) <= 0:
+            raise ValueError(f"Row {i}: SPLIT ratio must be positive")
+        if len(row["currency"]) != 3:
+            raise ValueError(f"Row {i}: currency must be a 3-letter code")
+        validate_date(row["ex_date"], "ex_date")
+        validate_date(row["record_date"], "record_date")
+        validate_date(row["pay_date"], "pay_date")
+        if row["record_date"] < row["ex_date"]:
+            raise ValueError(f"Row {i}: record_date before ex_date")
+        if row["pay_date"] < row["record_date"]:
+            raise ValueError(f"Row {i}: pay_date before record_date")
+    return rows
+
+
 def connect():
     try:
         import snowflake.connector
@@ -170,6 +210,7 @@ def load(conn, kind, csv_file, rows):
         "trades": "TRADES_STAGING",
         "positions": "POSITIONS_STAGING",
         "prices": "PRICES_STAGING",
+        "corporate_actions": "CORPORATE_ACTIONS_STAGING",
     }[kind]
     target = kind.upper()
     cur = conn.cursor()
@@ -212,7 +253,7 @@ def load(conn, kind, csv_file, rows):
                 VALUES
                     (s.account_id, s.cusip, s.quantity, s.cost_basis, s.as_of_date)
             """)
-        else:
+        elif kind == "prices":
             cur.execute("""
                 MERGE INTO PRICES t USING PRICES_STAGING s
                     ON t.cusip = s.cusip
@@ -224,6 +265,26 @@ def load(conn, kind, csv_file, rows):
                     (cusip, price_date, close_price)
                 VALUES
                     (s.cusip, s.price_date, s.close_price)
+            """)
+        else:
+            cur.execute("""
+                MERGE INTO CORPORATE_ACTIONS t USING CORPORATE_ACTIONS_STAGING s
+                    ON t.action_id = s.action_id
+                WHEN MATCHED THEN UPDATE SET
+                    t.cusip = s.cusip,
+                    t.action_type = s.action_type,
+                    t.ex_date = s.ex_date,
+                    t.record_date = s.record_date,
+                    t.pay_date = s.pay_date,
+                    t.amount_per_share = s.amount_per_share,
+                    t.currency = s.currency,
+                    t.loaded_at = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT
+                    (action_id, cusip, action_type, ex_date, record_date,
+                     pay_date, amount_per_share, currency)
+                VALUES
+                    (s.action_id, s.cusip, s.action_type, s.ex_date,
+                     s.record_date, s.pay_date, s.amount_per_share, s.currency)
             """)
         print(f"Loaded {len(rows)} {kind} rows into {target} "
               f"({cur.rowcount} rows merged).")
@@ -237,11 +298,13 @@ def main():
         "trades": TRADE_FIELDS,
         "positions": POSITION_FIELDS,
         "prices": PRICE_FIELDS,
+        "corporate_actions": CORPORATE_ACTION_FIELDS,
     }[args.kind]
     validate = {
         "trades": validate_trades,
         "positions": validate_positions,
         "prices": validate_prices,
+        "corporate_actions": validate_corporate_actions,
     }[args.kind]
     try:
         rows = validate(read_rows(args.csv_file, fields))
